@@ -23,11 +23,11 @@ jobs:
           dos2unix gradlew
           chmod +x gradlew
 
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug
+      - name: Build F-Droid Debug APK
+        run: ./gradlew assembleFdroidDebug
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: CanZE-btle-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/fdroid/debug/*.apk
