@@ -21,17 +21,26 @@
 
 package lu.fisch.canze.activities;
 
+import android.Manifest;
 import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.res.Resources;
 import android.graphics.Point;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.Html;
 import android.view.Display;
 import android.view.Menu;
@@ -40,10 +49,10 @@ import android.widget.TextView;
 
 import com.google.gson.Gson;
 
-import java.lang.reflect.Method;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -58,6 +67,7 @@ import androidx.preference.Preference;
 import androidx.preference.PreferenceFragmentCompat;
 import androidx.preference.PreferenceManager;
 import androidx.preference.SwitchPreference;
+import androidx.core.content.ContextCompat;
 import lu.fisch.canze.BuildConfig;
 import lu.fisch.canze.R;
 import lu.fisch.canze.actors.Utils;
@@ -905,6 +915,16 @@ public class SettingsActivity extends AppCompatActivity {
             fillDeviceList(); // if no BT, still allow the http devices
         }
 
+        // --- BLE device scanning for the device list ---------------------------
+        private static final long BLE_SCAN_PERIOD_MS = 12000;
+        private static final int REQUEST_BLE_SCAN_PERMISSION = 4242;
+        private BluetoothLeScanner bleScanner = null;
+        private ScanCallback bleScanCallback = null;
+        private boolean bleScanning = false;
+        // discovered BLE devices: address -> display name, in discovery order
+        private final LinkedHashMap<String, String> discoveredDevices = new LinkedHashMap<>();
+        private final Handler bleScanHandler = new Handler(Looper.getMainLooper());
+
         private void fillDeviceList() {
             // Get current device info
             String deviceAddress = settings.getString(SETTING_DEVICE_ADDRESS, null);
@@ -912,67 +932,152 @@ public class SettingsActivity extends AppCompatActivity {
             MainActivity.debug("SELECT: deviceAddress = " + deviceAddress);
             MainActivity.debug("SELECT: deviceName = " + deviceName);
 
-            // Create labels and values arrays
+            // start from a clean slate, draw the list (HTTP + configured device), then
+            // populate it live with whatever the BLE scan finds
+            discoveredDevices.clear();
+            rebuildDeviceList();
+            startBleScan();
+        }
+
+        // (re)build the ListPreference from the devices discovered so far
+        private void rebuildDeviceList() {
+            ListPreference devicesList = (ListPreference) findPreference(SETTING_DEVICE_CHOICE);
+            if (devicesList == null) return;
+
+            // remember the current selection so rebuilding does not clear it
+            CharSequence current = devicesList.getValue();
+
             List<CharSequence> listLabels = new ArrayList<>();
             List<CharSequence> listValues = new ArrayList<>();
 
-            int selectedIndex = -1;
-            //int i = 0; // activateing the selection is now done in loadDeviceSettings
+            // all BLE devices found by the scan so far
+            for (Map.Entry<String, String> e : discoveredDevices.entrySet()) {
+                listLabels.add(e.getValue() + "\n" + e.getKey());
+                listValues.add(e.getKey());
+            }
 
-            // Get the bluetooth adapter
-            BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
-            if (bluetoothAdapter != null) {
-                // get the devices
-                Set<BluetoothDevice> pairedDevices = bluetoothAdapter.getBondedDevices();
-                // if there are paired devices
-                if (pairedDevices.size() > 0) {
-                    // loop through paired devices
-                    for (BluetoothDevice device : pairedDevices) {
-                        // add the name and address to an array adapter to show in a ListView
-                        // see https://stackoverflow.com/questions/20658142/getting-the-renamed-name-of-an-android-bluetoothdevice
-                        String deviceAlias = device.getName();
-                        try {
-                            // getAliasName is preferred as it returns the user naming. This simplifies
-                            // identification if having several dongles, so you can name them "KONNWEI", "blue"
-                            // etcetera in Android's Bluetooth settings.
-                            // this will lint warning as getAliasName has @hide set.
-                            Method method = device.getClass().getMethod("getAliasName");
-                            // getMethod is supposed never to return null, but raise an exception instead
-                            //if (method != null) {
-                            deviceAlias = (String) method.invoke(device);
-                            //}
-                        } catch (Exception e) {
-                            // do nothing. Trapping here is no problem, as we already have the name
-                        }
-
-                        listLabels.add(deviceAlias + "\n" + device.getAddress());
-                        listValues.add(device.getAddress());
-
-                        // Set selected index if the device equals the one in the settings
-                        if (deviceAlias != null && deviceAlias.equals(deviceName)) {
-                            //selectedIndex = i; // plus one as HTTP is always first in list
-                            //MainActivity.debug("SELECT: found = "+i+" ("+deviceAlias+")");
-                        }
-                        //i++;
-                    }
-
-                }
+            // keep the currently configured device selectable even before it is rescanned
+            String cfgAddr = settings.getString(SETTING_DEVICE_ADDRESS, "");
+            String cfgName = settings.getString(SETTING_DEVICE_NAME, "");
+            if (cfgAddr != null && !cfgAddr.isEmpty() && !discoveredDevices.containsKey(cfgAddr)) {
+                listLabels.add((cfgName == null || cfgName.isEmpty() ? cfgAddr : cfgName) + "\n" + cfgAddr);
+                listValues.add(cfgAddr);
             }
 
             // Add a static entry for the HTTP Gateway
             listLabels.add("HTTP Gateway\n-");
             listValues.add(DEVICE_TYPE_HTTP_GATEWAY);
 
-            //if ("HTTP Gateway".equals(deviceName))
-            //    selectedIndex = i;
+            devicesList.setEntries(listLabels.toArray(new CharSequence[0]));
+            devicesList.setEntryValues(listValues.toArray(new CharSequence[0]));
 
-            // Map the labels/values to the list
-            ListPreference devicesList = (ListPreference) findPreference(SETTING_DEVICE_CHOICE);
-            devicesList.setEntries(listLabels.toArray(new CharSequence[listLabels.size()]));
-            devicesList.setEntryValues(listValues.toArray(new CharSequence[listValues.size()]));
+            // restore the previous selection
+            if (current != null && current.length() > 0) devicesList.setValue(current.toString());
+        }
 
-            // Select the actual device
-            //devicesList.setValueIndex(selectedIndex == -1 ? i : selectedIndex);
+        // start a Bluetooth LE scan; results are added to the device list as they arrive
+        private void startBleScan() {
+            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+            if (adapter == null || !adapter.isEnabled()) return;
+
+            // Android 12+ needs the BLUETOOTH_SCAN runtime permission to scan
+            if (Build.VERSION.SDK_INT >= 31
+                    && ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.BLUETOOTH_SCAN)
+                        != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.BLUETOOTH_SCAN}, REQUEST_BLE_SCAN_PERMISSION);
+                return;
+            }
+
+            bleScanner = adapter.getBluetoothLeScanner();
+            if (bleScanner == null) return;
+
+            if (bleScanCallback == null) {
+                bleScanCallback = new ScanCallback() {
+                    @Override
+                    public void onScanResult(int callbackType, ScanResult result) {
+                        addScanResult(result);
+                    }
+
+                    @Override
+                    public void onBatchScanResults(List<ScanResult> results) {
+                        for (ScanResult r : results) addScanResult(r);
+                    }
+
+                    @Override
+                    public void onScanFailed(int errorCode) {
+                        MainActivity.debug("BLE scan failed: " + errorCode);
+                        bleScanning = false;
+                    }
+                };
+            }
+
+            try {
+                ScanSettings scanSettings = new ScanSettings.Builder()
+                        .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                        .build();
+                // no filter: list every BLE device, the user picks their dongle
+                bleScanner.startScan(null, scanSettings, bleScanCallback);
+                bleScanning = true;
+                MainActivity.debug("BLE scan started");
+                // automatically stop after the scan period
+                bleScanHandler.removeCallbacksAndMessages(null);
+                bleScanHandler.postDelayed(this::stopBleScan, BLE_SCAN_PERIOD_MS);
+            } catch (SecurityException e) {
+                MainActivity.debug("BLE scan: missing permission");
+            }
+        }
+
+        private void addScanResult(ScanResult result) {
+            if (result == null || result.getDevice() == null) return;
+            BluetoothDevice device = result.getDevice();
+            String address = device.getAddress();
+            if (address == null) return;
+
+            String name = null;
+            try {
+                name = device.getName();
+            } catch (SecurityException e) {
+                // getName needs BLUETOOTH_CONNECT on some versions; fall back to the scan record
+            }
+            if ((name == null || name.isEmpty()) && result.getScanRecord() != null) {
+                name = result.getScanRecord().getDeviceName();
+            }
+            if (name == null || name.isEmpty()) name = "(unknown)";
+
+            String previous = discoveredDevices.put(address, name);
+            // only redraw when a new device appears or its name gets resolved
+            if (previous == null || !previous.equals(name)) {
+                rebuildDeviceList();
+            }
+        }
+
+        private void stopBleScan() {
+            bleScanHandler.removeCallbacksAndMessages(null);
+            if (bleScanning && bleScanner != null && bleScanCallback != null) {
+                try {
+                    bleScanner.stopScan(bleScanCallback);
+                } catch (SecurityException e) {
+                    // ignore
+                }
+            }
+            bleScanning = false;
+            MainActivity.debug("BLE scan stopped");
+        }
+
+        @Override
+        public void onPause() {
+            super.onPause();
+            stopBleScan();
+        }
+
+        @Override
+        public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+            super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+            if (requestCode == REQUEST_BLE_SCAN_PERMISSION
+                    && grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                startBleScan();
+            }
         }
 
         public void fillStartupActivityList() {

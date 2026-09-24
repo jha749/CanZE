@@ -21,30 +21,42 @@
 
 
 /*
- * Helper class to manage the Bluetooth connection
+ * Helper class to manage the Bluetooth connection.
+ *
+ * This implementation talks to a Bluetooth Low Energy (BLE / GATT) adapter that
+ * exposes a custom service with one "read" (notify) characteristic and one
+ * "write" characteristic. It replaces the old Bluetooth Classic SPP (RFCOMM)
+ * implementation while keeping the exact same public API (connect/disconnect/
+ * write/read/available/isConnected), so the rest of the app (ELM327, CanSee, ...)
+ * does not need to change: incoming notifications are buffered into a queue that
+ * read()/available() drain, and write() splits the payload into MTU-sized chunks.
  */
 package lu.fisch.canze.bluetooth;
 
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
-import android.bluetooth.BluetoothSocket;
+import android.bluetooth.BluetoothGatt;
+import android.bluetooth.BluetoothGattCallback;
+import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattDescriptor;
+import android.bluetooth.BluetoothGattService;
+import android.bluetooth.BluetoothProfile;
+import android.content.Context;
 import android.os.Build;
-import android.os.ParcelFileDescriptor;
-import android.util.Log;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.security.InvalidParameterException;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 import lu.fisch.canze.activities.MainActivity;
 import lu.fisch.canze.interfaces.BluetoothEvent;
 
 /**
  * Created by robertfisch on 03.09.2015.
+ * Converted from Bluetooth Classic SPP to Bluetooth Low Energy (GATT).
  */
 public class BluetoothManager {
 
@@ -54,9 +66,6 @@ public class BluetoothManager {
 
     private static BluetoothManager instance = null;
 
-    private InputStream inputStream = null;
-    private OutputStream outputStream = null;
-
     public static BluetoothManager getInstance() {
         if (instance == null)
             instance = new BluetoothManager();
@@ -64,18 +73,45 @@ public class BluetoothManager {
     }
 
     /* --------------------------------
+     * BLE service / characteristic UUIDs
+     * --------------------------------
+     * The adapter exposes a custom service with a notify ("read")
+     * characteristic and a write characteristic.
+     \ ------------------------------ */
+    private static final UUID SERVICE_UUID     = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb");
+    private static final UUID READ_CHAR_UUID   = UUID.fromString("0000fff1-0000-1000-8000-00805f9b34fb");
+    private static final UUID WRITE_CHAR_UUID  = UUID.fromString("0000fff2-0000-1000-8000-00805f9b34fb");
+    // Standard Client Characteristic Configuration Descriptor, used to enable notifications
+    private static final UUID CCCD_UUID        = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
+
+    /* --------------------------------
      * Attributes
      \ ------------------------------ */
-    // SPP UUID service
-    private static final UUID MY_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
     public static final int STATE_BLUETOOTH_NOT_AVAILABLE = -1;
     public static final int STATE_BLUETOOTH_ACTIVE = 1;
     public static final int STATE_BLUETOOTH_NOT_ACTIVE = 0;
 
+    private final BluetoothAdapter bluetoothAdapter;
 
-    private BluetoothAdapter bluetoothAdapter;
-    private BluetoothSocket bluetoothSocket = null;
+    private BluetoothGatt bluetoothGatt = null;
+    private BluetoothGattCharacteristic readCharacteristic = null;
+    private BluetoothGattCharacteristic writeCharacteristic = null;
+
+    // true once services are discovered and notifications are enabled
+    private volatile boolean connected = false;
+
+    // incoming bytes, filled by notifications (onCharacteristicChanged), drained by read()/available()
+    private final LinkedBlockingQueue<Byte> readQueue = new LinkedBlockingQueue<>();
+
+    // negotiated outgoing payload size (ATT_MTU - 3); default is the BLE minimum
+    private volatile int chunkSize = 20;
+
+    // handshake / write serialization
+    private volatile CountDownLatch readyLatch;
+    private volatile CountDownLatch writeLatch;
+    private static final long CONNECT_TIMEOUT_MS = 12000;
+    private static final long WRITE_TIMEOUT_MS   = 2000;
 
     public boolean isDummyMode() {
         return dummyMode;
@@ -129,18 +165,137 @@ public class BluetoothManager {
         }
     }
 
-    /**
-     * Creates a new Bluetooth socket from a given device
-     */
-    private BluetoothSocket createBluetoothSocket(BluetoothDevice device, boolean secure) throws IOException {
-        try {
-            final Method m = device.getClass().getMethod(secure ? "createRfcommSocketToServiceRecor" : "createInsecureRfcommSocketToServiceRecord", new Class[]{UUID.class});
-            return (BluetoothSocket) m.invoke(device, MY_UUID);
-        } catch (Exception e) {
-            debug("Could not create RFComm Connection");
+    /* --------------------------------
+     * GATT callback (all calls arrive on a binder thread)
+     \ ------------------------------ */
+
+    private final BluetoothGattCallback gattCallback = new BluetoothGattCallback() {
+        @Override
+        public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                debug("GATT connected, negotiating MTU");
+                try {
+                    // try to negotiate a bigger MTU for throughput; if the request
+                    // can't even be issued, fall back to discovering services directly
+                    if (!gatt.requestMtu(517)) {
+                        gatt.discoverServices();
+                    }
+                } catch (SecurityException e) {
+                    debug("Missing BLUETOOTH_CONNECT permission");
+                    releaseConnect();
+                }
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                debug("GATT disconnected (status " + status + ")");
+                connected = false;
+                readCharacteristic = null;
+                writeCharacteristic = null;
+                // unblock anything waiting on the handshake or on a write
+                releaseConnect();
+                if (writeLatch != null) writeLatch.countDown();
+            }
         }
-        return device.createRfcommSocketToServiceRecord(MY_UUID);
+
+        @Override
+        public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                chunkSize = mtu - 3;
+                debug("MTU = " + mtu + " (chunk " + chunkSize + ")");
+            }
+            try {
+                gatt.discoverServices();
+            } catch (SecurityException e) {
+                debug("Missing BLUETOOTH_CONNECT permission");
+                releaseConnect();
+            }
+        }
+
+        @Override
+        public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                debug("Service discovery failed: " + status);
+                releaseConnect();
+                return;
+            }
+            BluetoothGattService service = gatt.getService(SERVICE_UUID);
+            if (service == null) {
+                debug("Custom service not found: " + SERVICE_UUID);
+                releaseConnect();
+                return;
+            }
+            readCharacteristic = service.getCharacteristic(READ_CHAR_UUID);
+            writeCharacteristic = service.getCharacteristic(WRITE_CHAR_UUID);
+            if (readCharacteristic == null || writeCharacteristic == null) {
+                debug("Read and/or write characteristic not found");
+                releaseConnect();
+                return;
+            }
+
+            // choose a write type that lets us serialize on onCharacteristicWrite
+            if ((writeCharacteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE) != 0) {
+                writeCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            } else {
+                writeCharacteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+            }
+
+            // enable notifications on the read characteristic
+            try {
+                gatt.setCharacteristicNotification(readCharacteristic, true);
+                BluetoothGattDescriptor cccd = readCharacteristic.getDescriptor(CCCD_UUID);
+                if (cccd != null) {
+                    cccd.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                    gatt.writeDescriptor(cccd);
+                    // readiness is confirmed in onDescriptorWrite
+                } else {
+                    // no CCCD available: consider the link ready right away
+                    markReady();
+                }
+            } catch (SecurityException e) {
+                debug("Missing BLUETOOTH_CONNECT permission");
+                releaseConnect();
+            }
+        }
+
+        @Override
+        public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
+            debug("Notifications enabled (status " + status + ")");
+            markReady();
+        }
+
+        @Override
+        public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+            if (READ_CHAR_UUID.equals(characteristic.getUuid())) {
+                byte[] value = characteristic.getValue();
+                if (value != null) {
+                    for (byte b : value) {
+                        readQueue.offer(b);
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
+            // a chunk has been transmitted, release the waiting writer
+            if (writeLatch != null) writeLatch.countDown();
+        }
+    };
+
+    // mark the connection as ready and wake the connecting thread
+    private void markReady() {
+        readQueue.clear();
+        connected = true;
+        releaseConnect();
     }
+
+    // wake the thread blocked inside privateConnect(), if any
+    private void releaseConnect() {
+        CountDownLatch latch = readyLatch;
+        if (latch != null) latch.countDown();
+    }
+
+    /* --------------------------------
+     * connect / disconnect
+     \ ------------------------------ */
 
     public void connect() {
         if (dummyMode) return;
@@ -169,23 +324,15 @@ public class BluetoothManager {
         if (retry) {
             // remember parameters
             connectBluetoothAddress = bluetoothAddress;
-            connectSecure = secure;
+            connectSecure = secure; // unused for BLE, kept for API compatibility
             connectRetries = retries;
 
             // only continue if we got an address
             if (bluetoothAddress != null && !bluetoothAddress.isEmpty() && getHardwareState() == STATE_BLUETOOTH_ACTIVE) {
 
                 // make sure there is no more active connection
-                if (bluetoothSocket != null && bluetoothSocket.isConnected()) {
-                    try {
-                        debug("Closing previous socket");
-                        // bluetoothSocket.close();
-                        closeSocketAndclearFileDescriptor();
-                        bluetoothSocket = null;
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                    }
-                }
+                debug("Closing previous GATT (if any)");
+                closeGatt();
 
                 // execute attached event
                 if (bluetoothEvent != null) bluetoothEvent.onBeforeConnect();
@@ -194,46 +341,49 @@ public class BluetoothManager {
                 debug("Get remote device: " + bluetoothAddress);
                 BluetoothDevice device = bluetoothAdapter.getRemoteDevice(bluetoothAddress);
 
-                // create a socket
-                try {
-                    debug("Create new socket");
-                    bluetoothSocket = createBluetoothSocket(device, secure);
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-
                 // discovery is resource intensive so make sure it is stopped
                 debug("Cancel discovery");
-                bluetoothAdapter.cancelDiscovery();
-
                 try {
-                    debug("Connect the socket");
-                    if (bluetoothSocket != null)
-                        bluetoothSocket.connect();
+                    bluetoothAdapter.cancelDiscovery();
+                } catch (SecurityException e) {
+                    // ignore
+                }
 
-                    debug("Connect the streams");
-                    // init with null
-                    inputStream = null;
-                    outputStream = null;
-                    // connect input
-                    if(bluetoothSocket!=null)
-                        inputStream = bluetoothSocket.getInputStream();
+                // prepare for a fresh async handshake
+                connected = false;
+                readQueue.clear();
+                readyLatch = new CountDownLatch(1);
 
-                    // connect output
-                    if(bluetoothSocket!=null)
-                        outputStream = bluetoothSocket.getOutputStream();
-
-                    // execute attached event
-                    if (bluetoothEvent != null)
-                        bluetoothEvent.onAfterConnect(bluetoothSocket);
-
-                    // stop here and return if everything went well
-                    if(inputStream != null && outputStream != null) {
-                        debug("Connected");
-                        return;
+                // open the GATT connection
+                try {
+                    debug("Open GATT connection");
+                    Context context = MainActivity.getInstance().getApplicationContext();
+                    if (Build.VERSION.SDK_INT >= 23) {
+                        bluetoothGatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE);
+                    } else {
+                        bluetoothGatt = device.connectGatt(context, false, gattCallback);
                     }
-                } catch (IOException | SecurityException e) {
-                    //e.printStackTrace();
+                } catch (SecurityException e) {
+                    debug("Missing BLUETOOTH_CONNECT permission");
+                }
+
+                // wait for the async handshake (connected + services + notifications) to finish
+                if (bluetoothGatt != null) {
+                    try {
+                        readyLatch.await(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException e) {
+                        // ignore
+                    }
+                }
+
+                // execute attached event
+                if (bluetoothEvent != null && connected)
+                    bluetoothEvent.onAfterConnect();
+
+                // stop here and return if everything went well
+                if (connected) {
+                    debug("Connected");
+                    return;
                 }
             }
             // if we reach this line, something went wrong and no connection has been established
@@ -243,14 +393,8 @@ public class BluetoothManager {
             else if (getHardwareState() == STATE_BLUETOOTH_NOT_ACTIVE)
                 debug("Bluetooth not active");
 
-            if (bluetoothSocket != null)
-                // try {
-                    debug("Closing socket again ...");
-                    // bluetoothSocket.close();
-                    closeSocketAndclearFileDescriptor();
-                // } catch (IOException e) {
-                //     e.printStackTrace();
-                // }
+            debug("Closing GATT again ...");
+            closeGatt();
 
             debug(retries + " tries left");
             if (retries != RETRIES_NONE) {
@@ -298,7 +442,7 @@ public class BluetoothManager {
 
         try {
             // execute attached event
-            if (bluetoothEvent != null) bluetoothEvent.onBeforeDisconnect(bluetoothSocket);
+            if (bluetoothEvent != null) bluetoothEvent.onBeforeDisconnect();
 
             retry = false;
 
@@ -307,18 +451,13 @@ public class BluetoothManager {
                 retryThread.join();
             }
 
-            debug("Closing socket");
-            // close the socket
-            if (bluetoothSocket != null)
-                // bluetoothSocket.close();
-                closeSocketAndclearFileDescriptor();
+            debug("Closing GATT");
+            closeGatt();
 
             // execute attached event
             if (bluetoothEvent != null) bluetoothEvent.onAfterDisconnect();
 
             debug("Closed");
-        // } catch (IOException e) {
-        //     e.printStackTrace();
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
@@ -328,65 +467,82 @@ public class BluetoothManager {
      * input / output
      \ ------------------------------ */
 
-    // write a message to the output stream
+    // write a message to the write characteristic, chunked to the negotiated MTU
     public void write(String message) {
 
         if (dummyMode) return;
 
-        if (bluetoothSocket != null && bluetoothSocket.isConnected()) {
-            byte[] msgBuffer = message.getBytes();
-            try {
-                // outputstream should never be nll here, but seen it in crash reports so
-                // the strategy is to simply avoid
-                if (outputStream != null) {
-                    outputStream.write(msgBuffer);
-                } else {
-                    MainActivity.debug("BluetoothManager.write: outputStream is null");
-                }
-            } catch (IOException e) {
-                MainActivity.debug("BT: Error sending > " + e.getMessage());
+        if (!isConnected() || writeCharacteristic == null) {
+            MainActivity.debug("Write failed! Not connected ... M = " + message);
+            return;
+        }
+
+        byte[] data = message.getBytes();
+        int offset = 0;
+        while (offset < data.length) {
+            int len = Math.min(chunkSize, data.length - offset);
+            byte[] chunk = new byte[len];
+            System.arraycopy(data, offset, chunk, 0, len);
+            if (!writeChunk(chunk)) {
+                MainActivity.debug("BT: Error sending chunk");
+                break;
             }
-        } else {
-            MainActivity.debug("Write failed! Socket is closed ... M = " + message);
+            offset += len;
+        }
+    }
+
+    // write a single chunk and wait (BLE allows only one outstanding GATT op at a time)
+    private boolean writeChunk(byte[] chunk) {
+        BluetoothGatt gatt = bluetoothGatt;
+        BluetoothGattCharacteristic ch = writeCharacteristic;
+        if (gatt == null || ch == null) return false;
+        try {
+            writeLatch = new CountDownLatch(1);
+            ch.setValue(chunk);
+            if (!gatt.writeCharacteristic(ch)) {
+                return false;
+            }
+            return writeLatch.await(WRITE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (SecurityException e) {
+            MainActivity.debug("BT: missing BLUETOOTH_CONNECT permission");
+            return false;
+        } catch (InterruptedException e) {
+            return false;
         }
     }
 
     public int read(byte[] buffer) throws IOException {
 
-        if (dummyMode || bluetoothSocket == null) return 0;
+        if (dummyMode || !connected) return 0;
 
-        if (bluetoothSocket.isConnected())
-            return inputStream.read(buffer);
-        else
-            return 0;
+        int i = 0;
+        Byte b;
+        while (i < buffer.length && (b = readQueue.poll()) != null) {
+            buffer[i++] = b;
+        }
+        return i;
     }
 
     public int read() throws IOException {
 
-        if (dummyMode || bluetoothSocket == null) return -1;
+        if (dummyMode || !connected) return -1;
 
-        if (bluetoothSocket.isConnected() && inputStream != null)
-            return inputStream.read();
-        else
-            return -1;
+        Byte b = readQueue.poll();
+        return (b == null) ? -1 : (b & 0xFF);
     }
 
     public int available() throws IOException {
 
-        if (dummyMode || bluetoothSocket == null) return 0;
+        if (dummyMode || !connected) return 0;
 
-        if (bluetoothSocket.isConnected() && inputStream != null)
-            return inputStream.available();
-        else
-            return 0;
+        return readQueue.size();
     }
 
     public boolean isConnected() {
 
         if (dummyMode) return true;
 
-        if (bluetoothSocket == null) return false;
-        return bluetoothSocket.isConnected();
+        return connected && bluetoothGatt != null;
     }
 
     /* --------------------------------
@@ -404,28 +560,20 @@ public class BluetoothManager {
         this.dummyMode = dummyMode;
     }
 
-
-    /*
-    * https://codeday.me/jp/qa/20190630/1142774.html (use google translate)
-    * https://stackoverflow.com/questions/21166222/connecting-to-bluetooth-device-fails-in-deep-sleep
-    * lint balks ar getDeclaredField. Ignore that
-    *
-    */
-    private synchronized void closeSocketAndclearFileDescriptor() {
-        if (bluetoothSocket == null) return;
-        try {
-            if (Build.VERSION.SDK_INT < 23) {
-                Field field = BluetoothSocket.class.getDeclaredField("mPfd");
-                field.setAccessible(true);
-                ParcelFileDescriptor mPfd = (ParcelFileDescriptor) field.get(bluetoothSocket);
-                if (null != mPfd) {
-                    mPfd.close();
-                }
+    // close and release the GATT connection
+    private synchronized void closeGatt() {
+        if (bluetoothGatt != null) {
+            try {
+                bluetoothGatt.disconnect();
+                bluetoothGatt.close();
+            } catch (Exception e) {
+                /* do nothing */
             }
-            bluetoothSocket.close();
-        } catch (Exception e) {
-            /* do nothing */
+            bluetoothGatt = null;
         }
+        connected = false;
+        readCharacteristic = null;
+        writeCharacteristic = null;
     }
 
 }

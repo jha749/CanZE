@@ -26,7 +26,6 @@ import android.annotation.SuppressLint;
 import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
-import android.bluetooth.BluetoothSocket;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.DialogInterface;
@@ -487,14 +486,14 @@ public class MainActivity extends AppCompatActivity implements FieldListener /*,
             }
 
             @Override
-            public void onAfterConnect(BluetoothSocket bluetoothSocket) {
+            public void onAfterConnect() {
                 if (device != null)
                     device.init(visible);
                 showBluetoothState(BLUETOOTH_CONNECTED);
             }
 
             @Override
-            public void onBeforeDisconnect(BluetoothSocket bluetoothSocket) {
+            public void onBeforeDisconnect() {
             }
 
             @Override

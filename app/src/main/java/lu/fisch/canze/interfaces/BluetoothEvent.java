@@ -21,11 +21,9 @@
 
 package lu.fisch.canze.interfaces;
 
-import android.bluetooth.BluetoothSocket;
-
 public interface BluetoothEvent {
     void onBeforeConnect();
-    void onAfterConnect(BluetoothSocket bluetoothSocket);
-    void onBeforeDisconnect(BluetoothSocket bluetoothSocket);
+    void onAfterConnect();
+    void onBeforeDisconnect();
     void onAfterDisconnect();
 }
