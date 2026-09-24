@@ -22,7 +22,41 @@ jobs:
           sudo apt-get update && sudo apt-get install -y dos2unix
           dos2unix gradlew
           chmod +x gradlew
-
+      
+      - name: Create Dummy google-services.json
+        run: |
+          cat << 'EOF' > app/google-services.json
+          {
+            "project_info": {
+              "project_number": "1234567890",
+              "project_id": "dummy-project",
+              "storage_bucket": "dummy-project.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:1234567890:android:1234567890abcdef",
+                  "android_client_info": {
+                    "package_name": "lu.fisch.canze"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyDummyKeyForBuildOnly"
+                  }
+                ],
+                "services": {
+                  "analytics_service": {
+                    "status": 1
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+          
       - name: Build F-Droid Debug APK
         run: ./gradlew assembleFdroidDebug
 
